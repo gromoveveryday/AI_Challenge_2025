@@ -1,6 +1,4 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import urllib.parse
-import subprocess
 import os
 import json
 import pandas as pd
@@ -9,7 +7,6 @@ from models.model import EssayEvaluator
 
 class EssayHandler(BaseHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
-        # Инициализируем evaluator отдельно, чтобы избежать проблем с многопоточностью
         self._evaluator = None
         super().__init__(*args, **kwargs)
     
@@ -21,18 +18,15 @@ class EssayHandler(BaseHTTPRequestHandler):
     
     def send_error_to_start(self, error_message):
         """Перенаправляет на стартовую страницу с сообщением об ошибке"""
-        # Читаем start.html
         with open('templates/start.html', 'r', encoding='utf-8') as f:
             html_content = f.read()
     
-        # Добавляем блок с ошибкой перед формой
         error_html = f"""
         <div style="background: #ffebee; color: #c62828; padding: 15px; border-radius: 5px; border-left: 4px solid #c62828; margin-bottom: 20px;">
             <strong>⚠️ Ошибка:</strong> {error_message}
         </div>
         """
     
-        # Вставляем ошибку после заголовка h1
         html_content = html_content.replace(
             '<h1>Автоматическая проверка Эссе</h1>',
             f'<h1>Автоматическая проверка Эссе</h1>{error_html}'
@@ -42,6 +36,25 @@ class EssayHandler(BaseHTTPRequestHandler):
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
         self.wfile.write(html_content.encode())
+
+    def send_json_response(self, data, status=200):
+        """Отправляет JSON ответ"""
+        self.send_response(status)
+        self.send_header('Content-type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
+
+    def parse_json_body(self):
+        """Парсит JSON тело запроса"""
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length == 0:
+            return None
+        
+        body = self.rfile.read(content_length)
+        try:
+            return json.loads(body.decode('utf-8'))
+        except json.JSONDecodeError:
+            return None
 
     # -----------------------------
     # Обработка GET-запросов
@@ -53,11 +66,14 @@ class EssayHandler(BaseHTTPRequestHandler):
             elif self.path == '/result':
                 self.serve_static_file('templates/result.html')
             elif self.path == '/health':
-                # Добавляем health check endpoint
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok"}).encode())
+                # Health check endpoint
+                self.send_json_response({"status": "ok", "service": "essay_evaluator"})
+            
+            # API endpoints
+            elif self.path == '/api/health':
+                self.send_json_response({"status": "healthy", "version": "1.0"})
+            elif self.path == '/api/docs':
+                self.serve_api_documentation()
             elif self.path.startswith('/static/'):
                 file_path = self.path.split('?')[0][1:]
                 self.serve_static_file(file_path)
@@ -71,49 +87,230 @@ class EssayHandler(BaseHTTPRequestHandler):
     # Обработка POST-запросов
     # -----------------------------
     def do_POST(self):
-        if self.path == '/evaluate':
+        try:
+            # API endpoints
+            if self.path == '/api/evaluate':
+                self.handle_api_evaluate()
+            elif self.path == '/api/batch-evaluate':
+                self.handle_api_batch_evaluate()
+            elif self.path == '/evaluate':
+                self.handle_web_evaluate()
+            else:
+                self.send_error(404, "Endpoint not found")
+                
+        except Exception as e:
+            print(f"Error in POST: {str(e)}")
+            self.send_json_response({"error": str(e)}, 500)
+
+    def handle_web_evaluate(self):
+        """Обработка веб-формы (оригинальный функционал)"""
+        content_type = self.headers.get('Content-Type', '')
+
+        if 'multipart/form-data' in content_type:
+            form_data = self.parse_multipart_form_data()
+
+            csv_file = form_data.get('csv_file')
+            csv_path = form_data.get('csv_path')
+
+            if csv_path:
+                csv_path = csv_path.decode().strip()
+                print(f"Пользователь указал путь к CSV: {csv_path}")
+                results = self.process_csv_file(csv_path)
+            elif csv_file:
+                if not csv_file.startswith(b'reference_text_id') and not csv_file.startswith(b'essay_text') and b'.csv' not in str(csv_file[:100]).lower():
+                    self.send_error_to_start("Ошибка: загруженный файл не является CSV файлом")
+                    return
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp_file:
+                    tmp_file.write(csv_file)
+                    tmp_path = tmp_file.name
+                results = self.process_csv_file(tmp_path)
+                os.unlink(tmp_path)
+            else:
+                self.send_error_to_start("Ошибка: не передан CSV файл")
+                return
+
+            self.send_response(303)
+            self.send_header('Location', '/result')
+            self.end_headers()
+        else:
+            self.send_error(400, "Неподдерживаемый тип данных")
+
+    def handle_api_evaluate(self):
+        """API endpoint для оценки одного эссе"""
+        data = self.parse_json_body()
+        
+        if not data:
+            self.send_json_response({"error": "Invalid JSON"}, 400)
+            return
+
+        required_fields = ["essay_text", "task_text"]
+        missing_fields = [field for field in required_fields if field not in data]
+        
+        if missing_fields:
+            self.send_json_response({
+                "error": f"Missing required fields: {', '.join(missing_fields)}"
+            }, 400)
+            return
+
+        try:
+            essay_text = data["essay_text"]
+            task_text = data["task_text"]
+            essay_type = data.get("essay_type", 2)
+
+            if not essay_text.strip():
+                self.send_json_response({"error": "Essay text cannot be empty"}, 400)
+                return
+
+            # Оценка эссе
+            result = self.evaluator.evaluate_single_essay(essay_text, essay_type, task_text)
+            
+            # Добавляем дополнительную информацию
+            result.update({
+                "essay_type": essay_type,
+                "task_text": task_text,
+                "total_score": result["H1"] + result["H2"] + result["H3"] + result["H4"],
+                "status": "success"
+            })
+
+            self.send_json_response(result)
+            print(f"✅ Оценено эссе через API (тип: {essay_type})")
+
+        except Exception as e:
+            print(f"❌ Ошибка оценки через API: {str(e)}")
+            self.send_json_response({
+                "error": f"Evaluation failed: {str(e)}",
+                "status": "error"
+            }, 500)
+
+    def handle_api_batch_evaluate(self):
+        """API endpoint для пакетной оценки эссе"""
+        data = self.parse_json_body()
+        
+        if not data:
+            self.send_json_response({"error": "Invalid JSON"}, 400)
+            return
+
+        if "essays" not in data:
+            self.send_json_response({"error": "Missing 'essays' array"}, 400)
+            return
+
+        essays = data["essays"]
+        if not isinstance(essays, list):
+            self.send_json_response({"error": "'essays' must be an array"}, 400)
+            return
+
+        if len(essays) > 100:  # Лимит на пакетную обработку
+            self.send_json_response({"error": "Too many essays in batch (max 100)"}, 400)
+            return
+
+        results = []
+        for i, essay_data in enumerate(essays):
             try:
-                content_type = self.headers.get('Content-Type', '')
+                required_fields = ["essay_text", "task_text"]
+                missing_fields = [field for field in required_fields if field not in essay_data]
+                
+                if missing_fields:
+                    results.append({
+                        "id": i,
+                        "status": "error",
+                        "error": f"Missing fields: {', '.join(missing_fields)}"
+                    })
+                    continue
 
-                if 'multipart/form-data' in content_type:
-                    form_data = self.parse_multipart_form_data()
+                essay_text = essay_data["essay_text"]
+                task_text = essay_data["task_text"]
+                essay_type = essay_data.get("essay_type", 2)
 
-                    csv_file = form_data.get('csv_file')
-                    csv_path = form_data.get('csv_path')
+                if not essay_text.strip():
+                    results.append({
+                        "id": i,
+                        "status": "error", 
+                        "error": "Essay text cannot be empty"
+                    })
+                    continue
 
-                    if csv_path:
-                        csv_path = csv_path.decode().strip()
-                        print(f"Пользователь указал путь к CSV: {csv_path}")
-                        results = self.process_csv_file(csv_path)
-                    elif csv_file:
-                        # Проверка что это CSV файл
-                        if not csv_file.startswith(b'reference_text_id') and not csv_file.startswith(b'essay_text') and b'.csv' not in str(csv_file[:100]).lower():
-                            self.send_error_to_start("Ошибка: загруженный файл не является CSV файлом")
-                            return
-                        
-                        with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp_file:
-                            tmp_file.write(csv_file)
-                            tmp_path = tmp_file.name
-                        results = self.process_csv_file(tmp_path)
-                        os.unlink(tmp_path)
-                    else:
-                        self.send_error_to_start("Ошибка: не передан CSV файл")
-                        return
-
-                    # Перенаправляем на /result
-                    self.send_response(303)
-                    self.send_header('Location', '/result')
-                    self.end_headers()
-
-                else:
-                    self.send_error(400, "Неподдерживаемый тип данных")
+                # Оценка эссе
+                result = self.evaluator.evaluate_single_essay(essay_text, essay_type, task_text)
+                result.update({
+                    "id": i,
+                    "essay_type": essay_type,
+                    "total_score": result["H1"] + result["H2"] + result["H3"] + result["H4"],
+                    "status": "success"
+                })
+                results.append(result)
+                print(f"✅ Оценено эссе {i+1}/{len(essays)} через API")
 
             except Exception as e:
-                print(f"Запрос на обработку ошибки: {str(e)}")
-                self.send_error_to_start(f"Ошибка обработки: {str(e)}")
+                print(f"❌ Ошибка оценки эссе {i+1}: {str(e)}")
+                results.append({
+                    "id": i,
+                    "status": "error",
+                    "error": str(e)
+                })
+
+        self.send_json_response({
+            "results": results,
+            "total_processed": len(results),
+            "successful": len([r for r in results if r.get("status") == "success"]),
+            "failed": len([r for r in results if r.get("status") == "error"])
+        })
+
+    def serve_api_documentation(self):
+        """Отдает документацию по API"""
+        docs = {
+            "service": "Essay Evaluator API",
+            "version": "1.0",
+            "endpoints": {
+                "GET /api/health": {
+                    "description": "Health check",
+                    "response": {"status": "healthy"}
+                },
+                "POST /api/evaluate": {
+                    "description": "Evaluate single essay",
+                    "request": {
+                        "essay_text": "string (required)",
+                        "task_text": "string (required)", 
+                        "essay_type": "integer (optional, default: 2)"
+                    },
+                    "response": {
+                        "H1": "integer score",
+                        "H1_explanation": "string",
+                        "H2": "integer score",
+                        "H2_explanation": "string",
+                        "H3": "integer score", 
+                        "H3_explanation": "string",
+                        "H4": "integer score",
+                        "H4_explanation": "string",
+                        "total_score": "integer",
+                        "status": "success"
+                    }
+                },
+                "POST /api/batch-evaluate": {
+                    "description": "Evaluate multiple essays",
+                    "request": {
+                        "essays": [
+                            {
+                                "essay_text": "string",
+                                "task_text": "string",
+                                "essay_type": "integer"
+                            }
+                        ]
+                    },
+                    "response": {
+                        "results": "array of evaluation results",
+                        "total_processed": "integer",
+                        "successful": "integer",
+                        "failed": "integer"
+                    }
+                }
+            }
+        }
+        
+        self.send_json_response(docs)
 
     # -----------------------------
-    # Парсинг multipart/form-data
+    # Остальные методы без изменений
     # -----------------------------
     def parse_multipart_form_data(self):
         content_length = int(self.headers['Content-Length'])
@@ -133,27 +330,20 @@ class EssayHandler(BaseHTTPRequestHandler):
                 form_data[field_name] = content
         return form_data
 
-    # -----------------------------
-    # Обработка CSV файла
-    # -----------------------------
     def process_csv_file(self, file_path):
         try:
             print(f"Начинаем обработку CSV файла: {file_path}")
         
-            # Проверяем существование файла
             if not os.path.exists(file_path):
                 raise Exception("Файл не найден")
             
-            # Проверяем размер файла
             file_size = os.path.getsize(file_path)
             if file_size == 0:
                 raise Exception("Файл пустой")
         
-            # Пробуем прочитать CSV
             try:
                 df = pd.read_csv(file_path, encoding='utf-8')
             except UnicodeDecodeError:
-                # Пробуем другие кодировки
                 try:
                     df = pd.read_csv(file_path, encoding='cp1251')
                 except:
@@ -165,14 +355,11 @@ class EssayHandler(BaseHTTPRequestHandler):
             print(f"Файл прочитан успешно. Найдено {len(df)} строк")
             print(f"Колонки в файле: {list(df.columns)}")
 
-            # Приводим названия столбцов к нижнему регистру
             df.columns = [col.strip().lower() for col in df.columns]
 
-            # Проверяем обязательные колонки
             required_cols = ["essay_text", "task_text"]
             missing = [c for c in required_cols if c not in df.columns]
         
-            # Пробуем найти альтернативные названия
             if missing:
                 alt_mapping = {
                     "essay_text": ["reference_text", "текст", "text", "сочинение"],
@@ -193,18 +380,8 @@ class EssayHandler(BaseHTTPRequestHandler):
                     f"Найдены колонки: {', '.join(df.columns)}"
                 )
 
-            # Добавляем тип сочинения по умолчанию
             if "essay_type" not in df.columns:
                 df["essay_type"] = 2
-
-            # Проверяем инициализацию модели (API ключ)
-            try:
-                evaluator = self.evaluator
-            except Exception as e:
-                if "API" in str(e) or "credential" in str(e).lower() or "GIGACHAT" in str(e).upper():
-                    raise Exception("Ошибка API ключа GigaChat. Проверьте настройки окружения.")
-                else:
-                    raise Exception(f"Ошибка инициализации модели: {str(e)}")
 
             results = []
             for idx, row in df.iterrows():
@@ -242,7 +419,6 @@ class EssayHandler(BaseHTTPRequestHandler):
                         "total_score": 0
                     })
 
-            # Сохраняем результаты
             results_file_path = "static/temp_results.json"
             os.makedirs(os.path.dirname(results_file_path), exist_ok=True)
             with open(results_file_path, "w", encoding="utf-8") as f:
@@ -255,9 +431,6 @@ class EssayHandler(BaseHTTPRequestHandler):
             print(f"❌ Ошибка при обработке CSV файла: {str(e)}")
             raise Exception(f"Ошибка обработки файла: {str(e)}")
 
-    # -----------------------------
-    # Отдача статических файлов
-    # -----------------------------
     def serve_static_file(self, file_path):
         try:
             with open(file_path, 'rb') as file:
@@ -275,27 +448,26 @@ class EssayHandler(BaseHTTPRequestHandler):
             self.send_error(404, f"File {file_path} not found")
 
     def log_message(self, format, *args):
-        return  # без спама в консоли
+        return
 
 
-# -----------------------------
-# Запуск HTTP-сервера
-# -----------------------------
 def run_server():
-    # Создаем необходимые директории
     os.makedirs('templates', exist_ok=True)
     os.makedirs('static', exist_ok=True)
     
-    # Получаем порт из переменной окружения или используем 8000 по умолчанию
     port = int(os.environ.get('PORT', 8000))
     host = os.environ.get('HOST', '0.0.0.0')
     
     server = HTTPServer((host, port), EssayHandler)
     print(f"🚀 Сервер запущен на http://{host}:{port}")
-    print(f"✅ Health check доступен по http://{host}:{port}/health")
+    print(f"📚 API endpoints:")
+    print(f"   GET  http://{host}:{port}/api/health - Health check")
+    print(f"   GET  http://{host}:{port}/api/docs - API documentation") 
+    print(f"   POST http://{host}:{port}/api/evaluate - Evaluate single essay")
+    print(f"   POST http://{host}:{port}/api/batch-evaluate - Evaluate multiple essays")
+    print(f"🌐 Web interface: http://{host}:{port}/")
     server.serve_forever()
 
 
 if __name__ == '__main__':
-    # ensure_requirements_updated()
     run_server()
